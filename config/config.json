@@ -1,0 +1,27 @@
+{
+    "disk": {
+        "threshold_percent": 50,
+        "cooldown_hours": 1,
+        "state_file": "/tmp/disk_alert_state.json"
+    },
+    "log_parser": {
+        "log_levels": ["INFO", "WARN", "WARNING", "ERROR", "CRITICAL"]
+    },
+    "health_check": {
+        "timeout_seconds": 5,
+        "services": [
+            {"name": "httpbin",       "url": "https://httpbin.org/status/200"},
+            {"name": "google-dns",    "url": "https://dns.google"},
+            {"name": "cloudflare",    "url": "https://www.cloudflare.com"}
+        ]
+    },
+    "alerts": {
+        "slack_webhook_url": "",
+        "smtp_host": "smtp.gmail.com",
+        "smtp_port": 587,
+        "smtp_user": "",
+        "smtp_password": "",
+        "alert_from": "alerts@company.com",
+        "alert_to": "oncall@company.com"
+    }
+}
