@@ -1,4 +1,4 @@
-# sre-toolkit 🛠️
+# python-toolkit 🛠️
 
 A collection of production-grade Python scripts for SRE automation — log parsing, disk monitoring, and service health checks.
 
@@ -16,12 +16,6 @@ A collection of production-grade Python scripts for SRE automation — log parsi
 ---
 
 ## Quick Start
-
-```bash
-git clone https://github.com/yourname/sre-toolkit
-cd sre-toolkit
-pip install -r requirements.txt
-```
 
 ### Parse a log file
 ```bash
