@@ -1,0 +1,44 @@
+name: Pre-deployment health suite
+description: Verify all dependencies are healthy before deploying. Aborts on any failure.
+on_failure: abort
+
+steps:
+  - name: Notify - starting pre-deploy checks
+    type: slack
+    message: ":mag: Running pre-deploy health checks for {{ service }} ({{ env }})"
+
+  - name: Check database connectivity
+    type: http
+    url: "http://localhost:8080/readyz/db"
+    expected_status: 200
+    timeout: 5
+    retries: 2
+
+  - name: Check Redis connectivity
+    type: http
+    url: "http://localhost:8080/readyz/redis"
+    expected_status: 200
+    timeout: 5
+    retries: 2
+
+  - name: Check upstream API
+    type: http
+    url: "https://api.{{ env }}.internal/health"
+    expected_status: 200
+    timeout: 10
+    retries: 3
+
+  - name: Check disk space
+    type: shell
+    command: "bash -c 'df -h / | awk \"NR==2 {if (int($5) > 85) exit 1}\"'"
+    shell: true
+
+  - name: Check for high load
+    type: shell
+    command: "bash -c 'load=$(uptime | awk -F\"load average:\" \"{print $2}\" | cut -d, -f1); echo $load'"
+    shell: true
+    on_failure: continue
+
+  - name: All checks passed - proceed
+    type: slack
+    message: ":rocket: All pre-deploy checks passed for {{ service }} ({{ env }}). Deployment may proceed."

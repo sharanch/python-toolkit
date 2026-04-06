@@ -1,0 +1,39 @@
+name: Restart nginx and verify
+description: Gracefully reload nginx config, wait for workers to cycle, then confirm health
+on_failure: abort
+
+steps:
+  - name: Notify team - starting
+    type: slack
+    message: ":wrench: Starting nginx reload on {{ hostname }} (env={{ env }})"
+
+  - name: Test nginx config first
+    type: shell
+    command: nginx -t
+    timeout: 15
+
+  - name: Reload nginx
+    type: shell
+    command: systemctl reload nginx
+    timeout: 30
+    retries: 1
+
+  - name: Wait for workers to cycle
+    type: sleep
+    seconds: 5
+
+  - name: Health check - root
+    type: http
+    url: "http://localhost/health"
+    expected_status: 200
+    timeout: 10
+    retries: 3
+
+  - name: Confirm process running
+    type: shell
+    command: pgrep -x nginx
+    on_failure: continue
+
+  - name: Notify team - done
+    type: slack
+    message: ":white_check_mark: nginx reload complete on {{ hostname }}"
