@@ -30,12 +30,12 @@ steps:
 
   - name: Check disk space
     type: shell
-    command: "bash -c 'df -h / | awk \"NR==2 {if (int($5) > 85) exit 1}\"'"
+    command: "df -h / | awk 'NR==2 {if (int($5) > 85) exit 1}'"
     shell: true
 
   - name: Check for high load
     type: shell
-    command: "bash -c 'load=$(uptime | awk -F\"load average:\" \"{print $2}\" | cut -d, -f1); echo $load'"
+    command: "uptime | awk -F'load average:' '{print $2}' | cut -d, -f1"
     shell: true
     on_failure: continue
 

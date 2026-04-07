@@ -113,3 +113,17 @@ def send_alert(config, subject, body):
     slack_message = f"*{subject}*\n{body}"
     send_slack(slack_url, slack_message)
     send_email(alerts_config, subject, body)
+
+
+# ---------------------------------------------------------------------------
+# Aliases — alternate call signatures used by some scripts
+# ---------------------------------------------------------------------------
+
+def send_slack_alert(message, webhook_url):
+    """Alias for send_slack with swapped argument order."""
+    return send_slack(webhook_url, message)
+
+
+def send_email_alert(subject, body, config):
+    """Alias for send_email with positional subject/body."""
+    return send_email(config, subject, body)

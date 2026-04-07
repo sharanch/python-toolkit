@@ -1,12 +1,18 @@
 {
     "disk": {
-        "threshold_percent": 80,
-        "cooldown_hours": 1
+        "threshold_percent": 50,
+        "cooldown_hours": 1,
+        "state_file": "/tmp/disk_alert_state.json"
+    },
+    "log_parser": {
+        "log_levels": ["INFO", "WARN", "WARNING", "ERROR", "CRITICAL"]
     },
     "health_check": {
         "timeout_seconds": 5,
         "services": [
-            {"name": "my-api", "url": "https://myapi.com/health"}
+            {"name": "httpbin",    "url": "https://httpbin.org/status/200"},
+            {"name": "google-dns", "url": "https://dns.google"},
+            {"name": "cloudflare", "url": "https://www.cloudflare.com"}
         ]
     },
     "cert_checker": {
@@ -14,32 +20,25 @@
         "critical_days": 7,
         "domains": [
             "example.com",
-            "api.example.com",
-            "grafana.example.com:3000"
-        ]
-    },
-    "process_monitor": {
-        "cpu_threshold": 80.0,
-        "mem_threshold_mb": 512,
-        "processes": [
-            "nginx",
-            "postgres",
-            "redis-server"
+            "api.example.com"
         ]
     },
     "k8s_monitor": {
         "restart_threshold": 5,
-        "namespaces": [
-            "default",
-            "production"
-        ]
+        "namespaces": ["default", "production"]
+    },
+    "process_monitor": {
+        "cpu_threshold": 80,
+        "mem_threshold_mb": 512,
+        "processes": ["nginx", "postgres"]
     },
     "alerts": {
-        "slack_webhook_url": "https://hooks.slack.com/services/YOUR/WEBHOOK/HERE",
+        "slack_webhook_url": "",
         "smtp_host": "smtp.gmail.com",
         "smtp_port": 587,
-        "smtp_user": "alerts@company.com",
-        "smtp_password": "yourpassword",
+        "smtp_user": "",
+        "smtp_password": "",
+        "alert_from": "alerts@company.com",
         "alert_to": "oncall@company.com"
     }
 }

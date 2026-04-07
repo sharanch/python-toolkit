@@ -1,7 +1,6 @@
 #!/usr/bin/env python3
 """
-cert_expiry_checker.py
-
+cert_expiry_checker.py — SRE TLS Certificate Expiry Checker
 Check TLS certificate expiry for a list of domains.
 Alerts via Slack/email when a cert is expiring within the warning threshold.
 
@@ -14,42 +13,55 @@ Usage:
 import argparse
 import json
 import logging
+import os
 import socket
 import ssl
 import sys
 from datetime import datetime, timezone
-from pathlib import Path
 
-# Allow running from repo root or scripts/ dir
-sys.path.insert(0, str(Path(__file__).parent.parent))
-from scripts.alert import send_slack_alert, send_email_alert
-
+# ── logging setup ─────────────────────────────────────────────────────────────
 logging.basicConfig(
     level=logging.INFO,
     format="%(asctime)s [%(levelname)s] %(message)s",
-    datefmt="%Y-%m-%dT%H:%M:%S",
+    datefmt="%Y-%m-%d %H:%M:%S",
 )
-log = logging.getLogger(__name__)
+logger = logging.getLogger(__name__)
 
-CONFIG_PATH = Path(__file__).parent.parent / "config" / "config.json"
+# ── config ────────────────────────────────────────────────────────────────────
+CONFIG_PATH = os.path.join(os.path.dirname(__file__), "../config/config.json")
 
-DEFAULT_WARN_DAYS = 30
+DEFAULT_WARN_DAYS     = 30
 DEFAULT_CRITICAL_DAYS = 7
-DEFAULT_PORT = 443
-DEFAULT_TIMEOUT = 10
+DEFAULT_PORT          = 443
+DEFAULT_TIMEOUT       = 10
 
 
-def load_config() -> dict:
-    if CONFIG_PATH.exists():
-        with open(CONFIG_PATH) as f:
+def load_config():
+    """Load configuration from config.json."""
+    try:
+        with open(CONFIG_PATH, "r") as f:
             return json.load(f)
-    return {}
+    except FileNotFoundError:
+        logger.warning("config.json not found, using defaults")
+        return {}
+    except json.JSONDecodeError as e:
+        logger.error(f"Invalid config.json: {e}")
+        sys.exit(1)
 
 
-def get_cert_expiry(hostname: str, port: int = DEFAULT_PORT, timeout: int = DEFAULT_TIMEOUT) -> datetime:
+# ── core logic ────────────────────────────────────────────────────────────────
+def get_cert_expiry(hostname, port=DEFAULT_PORT, timeout=DEFAULT_TIMEOUT):
     """
     Open a TLS connection to hostname:port and return the certificate's
     notAfter datetime (UTC-aware).
+
+    Args:
+        hostname (str): Domain to check
+        port (int): Port to connect on
+        timeout (int): Connection timeout in seconds
+
+    Returns:
+        datetime: UTC-aware expiry datetime
     """
     ctx = ssl.create_default_context()
     with socket.create_connection((hostname, port), timeout=timeout) as sock:
@@ -58,39 +70,46 @@ def get_cert_expiry(hostname: str, port: int = DEFAULT_PORT, timeout: int = DEFA
 
     # notAfter format: 'Apr  6 12:00:00 2026 GMT'
     expiry_str = cert["notAfter"]
-    expiry_dt = datetime.strptime(expiry_str, "%b %d %H:%M:%S %Y %Z")
+    expiry_dt  = datetime.strptime(expiry_str, "%b %d %H:%M:%S %Y %Z")
     return expiry_dt.replace(tzinfo=timezone.utc)
 
 
-def check_domain(hostname: str, port: int, warn_days: int, critical_days: int) -> dict:
+def check_domain(hostname, port, warn_days, critical_days):
     """
-    Check a single domain. Returns a result dict with status, days_remaining, etc.
+    Check a single domain's certificate expiry.
+
+    Args:
+        hostname (str): Domain to check
+        port (int): TLS port
+        warn_days (int): Days before expiry to warn
+        critical_days (int): Days before expiry to go critical
+
+    Returns:
+        dict: Result with status, days_remaining, expiry, error
     """
     result = {
-        "hostname": hostname,
-        "port": port,
-        "status": "ok",
+        "hostname":       hostname,
+        "port":           port,
+        "status":         "ok",
         "days_remaining": None,
-        "expiry": None,
-        "error": None,
+        "expiry":         None,
+        "error":          None,
     }
 
     try:
-        expiry_dt = get_cert_expiry(hostname, port)
-        now = datetime.now(tz=timezone.utc)
+        expiry_dt      = get_cert_expiry(hostname, port)
+        now            = datetime.now(tz=timezone.utc)
         days_remaining = (expiry_dt - now).days
 
-        result["expiry"] = expiry_dt.strftime("%Y-%m-%d %H:%M:%S UTC")
+        result["expiry"]         = expiry_dt.strftime("%Y-%m-%d %H:%M:%S UTC")
         result["days_remaining"] = days_remaining
 
         if days_remaining <= critical_days:
             result["status"] = "critical"
         elif days_remaining <= warn_days:
             result["status"] = "warning"
-        else:
-            result["status"] = "ok"
 
-        log.info(
+        logger.info(
             "%-40s  expires: %s  (%d days)  [%s]",
             f"{hostname}:{port}",
             result["expiry"],
@@ -100,21 +119,22 @@ def check_domain(hostname: str, port: int, warn_days: int, critical_days: int) -
 
     except ssl.SSLCertVerificationError as e:
         result["status"] = "critical"
-        result["error"] = f"SSL verification failed: {e}"
-        log.error("%s — SSL verification failed: %s", hostname, e)
+        result["error"]  = f"SSL verification failed: {e}"
+        logger.error(f"{hostname} — SSL verification failed: {e}")
 
     except (socket.timeout, ConnectionRefusedError, OSError) as e:
         result["status"] = "error"
-        result["error"] = f"Connection error: {e}"
-        log.error("%s — connection error: %s", hostname, e)
+        result["error"]  = f"Connection error: {e}"
+        logger.error(f"{hostname} — connection error: {e}")
 
     return result
 
 
-def build_alert_message(results: list[dict], warn_days: int, critical_days: int) -> str:
+def build_alert_message(results, warn_days, critical_days):
+    """Build a formatted Slack/email alert message from results."""
     critical = [r for r in results if r["status"] == "critical"]
-    warning = [r for r in results if r["status"] == "warning"]
-    errors = [r for r in results if r["status"] == "error"]
+    warning  = [r for r in results if r["status"] == "warning"]
+    errors   = [r for r in results if r["status"] == "error"]
 
     lines = ["*TLS Certificate Expiry Report*\n"]
 
@@ -124,12 +144,18 @@ def build_alert_message(results: list[dict], warn_days: int, critical_days: int)
             if r["error"]:
                 lines.append(f"  • `{r['hostname']}:{r['port']}` — {r['error']}")
             else:
-                lines.append(f"  • `{r['hostname']}:{r['port']}` — expires {r['expiry']} ({r['days_remaining']} days)")
+                lines.append(
+                    f"  • `{r['hostname']}:{r['port']}` — "
+                    f"expires {r['expiry']} ({r['days_remaining']} days)"
+                )
 
     if warning:
         lines.append(f"\n:warning: *WARNING* (≤{warn_days} days)")
         for r in warning:
-            lines.append(f"  • `{r['hostname']}:{r['port']}` — expires {r['expiry']} ({r['days_remaining']} days)")
+            lines.append(
+                f"  • `{r['hostname']}:{r['port']}` — "
+                f"expires {r['expiry']} ({r['days_remaining']} days)"
+            )
 
     if errors:
         lines.append("\n:x: *CONNECTION ERRORS*")
@@ -139,6 +165,7 @@ def build_alert_message(results: list[dict], warn_days: int, critical_days: int)
     return "\n".join(lines)
 
 
+# ── entrypoint ────────────────────────────────────────────────────────────────
 def main():
     parser = argparse.ArgumentParser(description="TLS certificate expiry checker")
     parser.add_argument(
@@ -165,17 +192,19 @@ def main():
     )
     args = parser.parse_args()
 
-    config = load_config()
+    config      = load_config()
     cert_config = config.get("cert_checker", {})
-    alerts_config = config.get("alerts", {})
 
-    # Build domain list: CLI args take precedence over config
-    domains_raw = args.domains or cert_config.get("domains", [])
+    # CLI args take precedence over config
+    domains_raw   = args.domains or cert_config.get("domains", [])
+    warn_days     = args.warn_days     or cert_config.get("warn_days",     DEFAULT_WARN_DAYS)
+    critical_days = args.critical_days or cert_config.get("critical_days", DEFAULT_CRITICAL_DAYS)
+
     if not domains_raw:
-        log.error("No domains specified. Pass --domains or set cert_checker.domains in config.json")
+        logger.error("No domains specified. Pass --domains or set cert_checker.domains in config.json")
         sys.exit(1)
 
-    # Parse optional :port suffix
+    # parse optional :port suffix
     targets = []
     for entry in domains_raw:
         if ":" in entry:
@@ -184,38 +213,21 @@ def main():
         else:
             targets.append((entry, DEFAULT_PORT))
 
-    warn_days = args.warn_days or cert_config.get("warn_days", DEFAULT_WARN_DAYS)
-    critical_days = args.critical_days or cert_config.get("critical_days", DEFAULT_CRITICAL_DAYS)
-
-    log.info("Checking %d domain(s) — warn=%dd  critical=%dd", len(targets), warn_days, critical_days)
+    logger.info(f"Checking {len(targets)} domain(s) — warn={warn_days}d  critical={critical_days}d")
 
     results = [check_domain(host, port, warn_days, critical_days) for host, port in targets]
 
-    # Summary
-    ok = sum(1 for r in results if r["status"] == "ok")
+    ok   = sum(1 for r in results if r["status"] == "ok")
     warn = sum(1 for r in results if r["status"] == "warning")
     crit = sum(1 for r in results if r["status"] in ("critical", "error"))
-    log.info("Summary — OK: %d  WARNING: %d  CRITICAL/ERROR: %d", ok, warn, crit)
+    logger.info(f"Summary — OK: {ok}  WARNING: {warn}  CRITICAL/ERROR: {crit}")
 
-    # Alert if any non-ok results
     needs_alert = any(r["status"] != "ok" for r in results)
     if needs_alert and not args.no_alert:
         message = build_alert_message(results, warn_days, critical_days)
-        slack_url = alerts_config.get("slack_webhook_url")
-        if slack_url:
-            send_slack_alert(message, slack_url)
-        else:
-            log.warning("No Slack webhook configured — skipping Slack alert")
+        from alert import send_alert
+        send_alert(config, "[CERT ALERT] TLS certificate expiry warning", message)
 
-        smtp_user = alerts_config.get("smtp_user")
-        if smtp_user:
-            send_email_alert(
-                subject="[CERT ALERT] TLS certificate expiry warning",
-                body=message,
-                config=alerts_config,
-            )
-
-    # Exit code reflects worst status for use in cron/CI
     if crit:
         sys.exit(2)
     if warn:

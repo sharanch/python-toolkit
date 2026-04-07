@@ -1,13 +1,14 @@
 #!/usr/bin/env python3
 """
-runbook_runner.py
-
+runbook_runner.py — SRE Runbook Runner
 Execute YAML-defined runbooks: ordered steps that run shell commands,
-HTTP checks, or send Slack notifications. Each step can have retries,
+HTTP checks, or send Slack notifications. Each step supports retries,
 timeouts, and on-failure behaviour (abort or continue).
 
 Designed for incident response automation, maintenance windows, and
 repeatable operational procedures.
+
+Requires: pip install pyyaml requests
 
 Usage:
     python scripts/runbook_runner.py --runbook runbooks/restart_service.yaml
@@ -39,24 +40,23 @@ Runbook YAML format:
         expected_status: 200
         timeout: 10
         retries: 3
-
-      - name: Check process
-        type: shell
-        command: "pgrep -x nginx"
-        on_failure: continue   # override global policy per-step
 """
 
 import argparse
 import json
 import logging
+import os
 import re
 import shlex
 import subprocess
 import sys
 import time
-from pathlib import Path
 
-import requests
+try:
+    import requests
+except ImportError:
+    print("ERROR: requests is required — run: pip install requests")
+    sys.exit(1)
 
 try:
     import yaml
@@ -64,35 +64,47 @@ except ImportError:
     print("ERROR: PyYAML is required — run: pip install pyyaml")
     sys.exit(1)
 
-sys.path.insert(0, str(Path(__file__).parent.parent))
-from scripts.alert import send_slack_alert
-
+# ── logging setup ─────────────────────────────────────────────────────────────
 logging.basicConfig(
     level=logging.INFO,
     format="%(asctime)s [%(levelname)s] %(message)s",
-    datefmt="%Y-%m-%dT%H:%M:%S",
+    datefmt="%Y-%m-%d %H:%M:%S",
 )
-log = logging.getLogger(__name__)
+logger = logging.getLogger(__name__)
 
-CONFIG_PATH = Path(__file__).parent.parent / "config" / "config.json"
+# ── config ────────────────────────────────────────────────────────────────────
+CONFIG_PATH = os.path.join(os.path.dirname(__file__), "../config/config.json")
 
-# Step result constants
-RESULT_OK = "ok"
-RESULT_FAILED = "failed"
+RESULT_OK      = "ok"
+RESULT_FAILED  = "failed"
 RESULT_SKIPPED = "skipped"
 
 
-def load_config() -> dict:
-    if CONFIG_PATH.exists():
-        with open(CONFIG_PATH) as f:
+def load_config():
+    """Load configuration from config.json."""
+    try:
+        with open(CONFIG_PATH, "r") as f:
             return json.load(f)
-    return {}
+    except FileNotFoundError:
+        logger.warning("config.json not found, using defaults")
+        return {}
+    except json.JSONDecodeError as e:
+        logger.error(f"Invalid config.json: {e}")
+        sys.exit(1)
 
 
-def render_template(text: str, variables: dict) -> str:
+# ── template rendering ────────────────────────────────────────────────────────
+def render_template(text, variables):
     """
     Replace {{ var }} placeholders with values from variables dict.
     Unknown variables are left as-is.
+
+    Args:
+        text (str): Template string
+        variables (dict): Variable substitutions
+
+    Returns:
+        str: Rendered string
     """
     def replacer(match):
         key = match.group(1).strip()
@@ -100,7 +112,7 @@ def render_template(text: str, variables: dict) -> str:
     return re.sub(r"\{\{\s*(\w+)\s*\}\}", replacer, str(text))
 
 
-def render_step(step: dict, variables: dict) -> dict:
+def render_step(step, variables):
     """Recursively render template variables in all string values of a step."""
     rendered = {}
     for k, v in step.items():
@@ -113,27 +125,34 @@ def render_step(step: dict, variables: dict) -> dict:
     return rendered
 
 
-# ---------------------------------------------------------------------------
-# Step executors
-# ---------------------------------------------------------------------------
+# ── step executors ────────────────────────────────────────────────────────────
+def run_shell_step(step, dry_run):
+    """
+    Run a shell command step.
 
-def run_shell_step(step: dict, dry_run: bool) -> tuple[bool, str]:
+    Args:
+        step (dict): Step config with command, timeout, retries
+        dry_run (bool): If True, print what would run without executing
+
+    Returns:
+        tuple: (success bool, detail string)
+    """
     command = step["command"]
     timeout = step.get("timeout", 60)
     retries = step.get("retries", 0)
-    shell = step.get("shell", False)  # True to run via bash -c
+    shell   = step.get("shell", False)
 
     if dry_run:
-        log.info("  [DRY RUN] Would run: %s", command)
+        logger.info(f"  [DRY RUN] Would run: {command}")
         return True, "dry-run"
 
     attempt = 0
     while attempt <= retries:
         try:
             if attempt > 0:
-                log.info("  Retry %d/%d...", attempt, retries)
+                logger.info(f"  Retry {attempt}/{retries}...")
 
-            args = command if shell else shlex.split(command)
+            args   = command if shell else shlex.split(command)
             result = subprocess.run(
                 args,
                 capture_output=True,
@@ -142,25 +161,21 @@ def run_shell_step(step: dict, dry_run: bool) -> tuple[bool, str]:
                 shell=shell,
             )
 
-            stdout = result.stdout.strip()
-            stderr = result.stderr.strip()
-
-            if stdout:
-                for line in stdout.splitlines():
-                    log.info("  stdout: %s", line)
-            if stderr:
-                for line in stderr.splitlines():
-                    log.warning("  stderr: %s", line)
+            if result.stdout.strip():
+                for line in result.stdout.strip().splitlines():
+                    logger.info(f"  stdout: {line}")
+            if result.stderr.strip():
+                for line in result.stderr.strip().splitlines():
+                    logger.warning(f"  stderr: {line}")
 
             if result.returncode == 0:
-                return True, stdout or "exit 0"
-            else:
-                output = f"exit {result.returncode}: {stderr or stdout}"
-                log.warning("  Command failed: %s", output)
-                attempt += 1
+                return True, result.stdout.strip() or "exit 0"
+
+            logger.warning(f"  Command failed: exit {result.returncode}")
+            attempt += 1
 
         except subprocess.TimeoutExpired:
-            log.error("  Command timed out after %ds", timeout)
+            logger.error(f"  Command timed out after {timeout}s")
             attempt += 1
         except FileNotFoundError as e:
             return False, f"Command not found: {e}"
@@ -168,24 +183,34 @@ def run_shell_step(step: dict, dry_run: bool) -> tuple[bool, str]:
     return False, f"Failed after {retries + 1} attempt(s)"
 
 
-def run_http_step(step: dict, dry_run: bool) -> tuple[bool, str]:
-    url = step["url"]
-    method = step.get("method", "GET").upper()
+def run_http_step(step, dry_run):
+    """
+    Run an HTTP health check step.
+
+    Args:
+        step (dict): Step config with url, method, expected_status, timeout, retries
+        dry_run (bool): If True, skip execution
+
+    Returns:
+        tuple: (success bool, detail string)
+    """
+    url             = step["url"]
+    method          = step.get("method", "GET").upper()
     expected_status = step.get("expected_status", 200)
-    timeout = step.get("timeout", 10)
-    retries = step.get("retries", 0)
-    headers = step.get("headers", {})
-    body = step.get("body")
+    timeout         = step.get("timeout", 10)
+    retries         = step.get("retries", 0)
+    headers         = step.get("headers", {})
+    body            = step.get("body")
 
     if dry_run:
-        log.info("  [DRY RUN] Would %s %s (expect %d)", method, url, expected_status)
+        logger.info(f"  [DRY RUN] Would {method} {url} (expect {expected_status})")
         return True, "dry-run"
 
     attempt = 0
     while attempt <= retries:
         try:
             if attempt > 0:
-                log.info("  Retry %d/%d...", attempt, retries)
+                logger.info(f"  Retry {attempt}/{retries}...")
 
             resp = requests.request(
                 method, url,
@@ -193,62 +218,73 @@ def run_http_step(step: dict, dry_run: bool) -> tuple[bool, str]:
                 json=body if body else None,
                 timeout=timeout,
             )
-
-            log.info("  %s %s -> %d (%dms)", method, url, resp.status_code,
-                     int(resp.elapsed.total_seconds() * 1000))
+            elapsed_ms = int(resp.elapsed.total_seconds() * 1000)
+            logger.info(f"  {method} {url} -> {resp.status_code} ({elapsed_ms}ms)")
 
             if resp.status_code == expected_status:
                 return True, f"HTTP {resp.status_code}"
 
-            log.warning("  Expected %d, got %d", expected_status, resp.status_code)
+            logger.warning(f"  Expected {expected_status}, got {resp.status_code}")
             attempt += 1
 
         except requests.exceptions.Timeout:
-            log.warning("  Request timed out after %ds", timeout)
+            logger.warning(f"  Request timed out after {timeout}s")
             attempt += 1
         except requests.exceptions.ConnectionError as e:
-            log.warning("  Connection error: %s", e)
+            logger.warning(f"  Connection error: {e}")
             attempt += 1
 
     return False, f"HTTP check failed after {retries + 1} attempt(s)"
 
 
-def run_sleep_step(step: dict, dry_run: bool) -> tuple[bool, str]:
+def run_sleep_step(step, dry_run):
+    """Run a sleep/wait step."""
     seconds = step.get("seconds", 1)
     if dry_run:
-        log.info("  [DRY RUN] Would sleep %ds", seconds)
+        logger.info(f"  [DRY RUN] Would sleep {seconds}s")
         return True, "dry-run"
-    log.info("  Sleeping %ds...", seconds)
+    logger.info(f"  Sleeping {seconds}s...")
     time.sleep(seconds)
     return True, f"slept {seconds}s"
 
 
-def run_slack_step(step: dict, config: dict, dry_run: bool) -> tuple[bool, str]:
+def run_slack_step(step, config, dry_run):
+    """Run a Slack notification step."""
     message = step.get("message", "")
     webhook = step.get("webhook_url") or config.get("alerts", {}).get("slack_webhook_url")
 
     if dry_run:
-        log.info("  [DRY RUN] Would send Slack: %s", message)
+        logger.info(f"  [DRY RUN] Would send Slack: {message}")
         return True, "dry-run"
 
     if not webhook:
-        log.warning("  No Slack webhook configured — skipping")
+        logger.warning("  No Slack webhook configured — skipping")
         return True, "skipped (no webhook)"
 
-    send_slack_alert(message, webhook)
+    from alert import send_slack
+    send_slack(webhook, message)
     return True, "sent"
 
 
-# ---------------------------------------------------------------------------
-# Runner
-# ---------------------------------------------------------------------------
+# ── runner ────────────────────────────────────────────────────────────────────
+def execute_step(step, config, variables, dry_run):
+    """
+    Execute a single runbook step.
 
-def execute_step(step: dict, config: dict, variables: dict, dry_run: bool) -> dict:
-    step = render_step(step, variables)
+    Args:
+        step (dict): Step definition
+        config (dict): Full project config
+        variables (dict): Template variables
+        dry_run (bool): Dry run mode
+
+    Returns:
+        dict: Step result with status, detail, elapsed_s
+    """
+    step      = render_step(step, variables)
     step_name = step.get("name", "(unnamed)")
     step_type = step.get("type", "shell")
 
-    log.info("--- Step: %s [%s]", step_name, step_type)
+    logger.info(f"--- Step: {step_name} [{step_type}]")
 
     start = time.monotonic()
     try:
@@ -261,52 +297,64 @@ def execute_step(step: dict, config: dict, variables: dict, dry_run: bool) -> di
         elif step_type == "slack":
             ok, detail = run_slack_step(step, config, dry_run)
         else:
-            log.error("  Unknown step type: %s", step_type)
+            logger.error(f"  Unknown step type: {step_type}")
             ok, detail = False, f"unknown type: {step_type}"
     except Exception as e:
-        log.exception("  Unexpected error in step: %s", e)
+        logger.exception(f"  Unexpected error in step: {e}")
         ok, detail = False, str(e)
 
     elapsed = round(time.monotonic() - start, 2)
-    status = RESULT_OK if ok else RESULT_FAILED
-    log.info("  [%s] in %.2fs — %s", status.upper(), elapsed, detail)
+    status  = RESULT_OK if ok else RESULT_FAILED
+    logger.info(f"  [{status.upper()}] in {elapsed:.2f}s — {detail}")
 
     return {
-        "name": step_name,
-        "type": step_type,
-        "status": status,
-        "detail": detail,
+        "name":      step_name,
+        "type":      step_type,
+        "status":    status,
+        "detail":    detail,
         "elapsed_s": elapsed,
     }
 
 
-def run_runbook(runbook: dict, config: dict, variables: dict, dry_run: bool) -> dict:
-    name = runbook.get("name", "Unnamed Runbook")
-    description = runbook.get("description", "")
-    steps = runbook.get("steps", [])
+def run_runbook(runbook, config, variables, dry_run):
+    """
+    Execute all steps in a runbook.
+
+    Args:
+        runbook (dict): Parsed runbook YAML
+        config (dict): Full project config
+        variables (dict): Template variables from CLI
+        dry_run (bool): Dry run mode
+
+    Returns:
+        dict: Summary with success flag, step results, counts, and total time
+    """
+    name             = runbook.get("name", "Unnamed Runbook")
+    description      = runbook.get("description", "")
+    steps            = runbook.get("steps", [])
     global_on_failure = runbook.get("on_failure", "abort")
 
-    log.info("=" * 60)
-    log.info("Runbook: %s", name)
+    logger.info("=" * 60)
+    logger.info(f"Runbook: {name}")
     if description:
-        log.info("         %s", description)
+        logger.info(f"         {description}")
     if dry_run:
-        log.info("         *** DRY RUN MODE — no changes will be made ***")
-    log.info("         Steps: %d  |  on_failure: %s", len(steps), global_on_failure)
-    log.info("=" * 60)
+        logger.info("         *** DRY RUN MODE — no changes will be made ***")
+    logger.info(f"         Steps: {len(steps)}  |  on_failure: {global_on_failure}")
+    logger.info("=" * 60)
 
-    results = []
-    aborted = False
+    results      = []
+    aborted      = False
     abort_reason = None
 
     for i, step in enumerate(steps, 1):
         if aborted:
-            log.warning("Skipping step %d/%d: %s (runbook aborted)", i, len(steps), step.get("name", ""))
+            logger.warning(f"Skipping step {i}/{len(steps)}: {step.get('name', '')} (runbook aborted)")
             results.append({
-                "name": step.get("name", "(unnamed)"),
-                "type": step.get("type", "shell"),
-                "status": RESULT_SKIPPED,
-                "detail": "runbook aborted",
+                "name":      step.get("name", "(unnamed)"),
+                "type":      step.get("type", "shell"),
+                "status":    RESULT_SKIPPED,
+                "detail":    "runbook aborted",
                 "elapsed_s": 0,
             })
             continue
@@ -317,84 +365,71 @@ def run_runbook(runbook: dict, config: dict, variables: dict, dry_run: bool) -> 
         if result["status"] == RESULT_FAILED:
             step_on_failure = step.get("on_failure", global_on_failure)
             if step_on_failure == "abort":
-                aborted = True
+                aborted      = True
                 abort_reason = f"Step '{result['name']}' failed: {result['detail']}"
-                log.error("Runbook aborted: %s", abort_reason)
+                logger.error(f"Runbook aborted: {abort_reason}")
 
-    ok_count = sum(1 for r in results if r["status"] == RESULT_OK)
+    ok_count   = sum(1 for r in results if r["status"] == RESULT_OK)
     fail_count = sum(1 for r in results if r["status"] == RESULT_FAILED)
     skip_count = sum(1 for r in results if r["status"] == RESULT_SKIPPED)
     total_time = round(sum(r["elapsed_s"] for r in results), 2)
+    success    = fail_count == 0 and not aborted
 
-    success = fail_count == 0 and not aborted
-
-    log.info("=" * 60)
-    log.info(
-        "Result: %s | OK: %d  FAILED: %d  SKIPPED: %d | %.2fs",
-        "SUCCESS" if success else "FAILED",
-        ok_count, fail_count, skip_count, total_time,
+    logger.info("=" * 60)
+    logger.info(
+        f"Result: {'SUCCESS' if success else 'FAILED'} | "
+        f"OK: {ok_count}  FAILED: {fail_count}  SKIPPED: {skip_count} | {total_time:.2f}s"
     )
-    log.info("=" * 60)
+    logger.info("=" * 60)
 
     return {
-        "runbook": name,
-        "success": success,
-        "aborted": aborted,
+        "runbook":      name,
+        "success":      success,
+        "aborted":      aborted,
         "abort_reason": abort_reason,
-        "steps": results,
-        "ok": ok_count,
-        "failed": fail_count,
-        "skipped": skip_count,
+        "steps":        results,
+        "ok":           ok_count,
+        "failed":       fail_count,
+        "skipped":      skip_count,
         "total_time_s": total_time,
     }
 
 
+# ── entrypoint ────────────────────────────────────────────────────────────────
 def main():
     parser = argparse.ArgumentParser(description="Execute YAML-defined SRE runbooks")
-    parser.add_argument("--runbook", required=True, help="Path to runbook YAML file")
-    parser.add_argument(
-        "--dry-run",
-        action="store_true",
-        help="Simulate execution without making any changes",
-    )
-    parser.add_argument(
-        "--var",
-        action="append",
-        metavar="KEY=VALUE",
-        help="Template variable (repeatable): --var env=prod --var region=us-east-1",
-    )
-    parser.add_argument(
-        "--output",
-        help="Write JSON results to this file",
-    )
+    parser.add_argument("--runbook",  required=True, help="Path to runbook YAML file")
+    parser.add_argument("--dry-run",  action="store_true",
+                        help="Simulate execution without making any changes")
+    parser.add_argument("--var",      action="append", metavar="KEY=VALUE",
+                        help="Template variable (repeatable): --var env=prod --var region=us-east-1")
+    parser.add_argument("--output",   help="Write JSON results to this file")
     args = parser.parse_args()
 
-    # Parse --var key=value pairs
-    variables: dict[str, str] = {}
+    # parse --var key=value pairs
+    variables = {}
     for pair in (args.var or []):
         if "=" not in pair:
-            log.error("Invalid --var format (expected KEY=VALUE): %s", pair)
+            logger.error(f"Invalid --var format (expected KEY=VALUE): {pair}")
             sys.exit(1)
         k, v = pair.split("=", 1)
         variables[k] = v
 
-    runbook_path = Path(args.runbook)
-    if not runbook_path.exists():
-        log.error("Runbook not found: %s", runbook_path)
+    if not os.path.exists(args.runbook):
+        logger.error(f"Runbook not found: {args.runbook}")
         sys.exit(1)
 
-    with open(runbook_path) as f:
+    with open(args.runbook, "r") as f:
         runbook = yaml.safe_load(f)
 
-    config = load_config()
+    config  = load_config()
     summary = run_runbook(runbook, config, variables, dry_run=args.dry_run)
 
     if args.output:
-        output_path = Path(args.output)
-        output_path.parent.mkdir(parents=True, exist_ok=True)
-        with open(output_path, "w") as f:
+        os.makedirs(os.path.dirname(args.output) or ".", exist_ok=True)
+        with open(args.output, "w") as f:
             json.dump(summary, f, indent=2)
-        log.info("Results written to %s", output_path)
+        logger.info(f"Results written to {args.output}")
 
     sys.exit(0 if summary["success"] else 1)
 
